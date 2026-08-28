@@ -1,0 +1,122 @@
+name: Auto Sync & Build RikkaHub Debug
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # 1. 配置 Git 代理使 Submodule 统一走 HTTPS
+      - name: Configure Git for Submodules
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      # 2. 拉取代码并递归下载子模块（使用 PAT 确保拥有推送 workflow 文件的权限）
+      - name: Checkout Repository & Submodules
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WORKFLOW_PAT }}
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      # 3. 核心：检测母仓库更新状态 与 首次 Release 状态
+      - name: Sync from Upstream & Check Release
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/rikkahub/rikkahub.git || true
+          git fetch upstream master
+
+          # 统计母仓库领先的 Commit 数量
+          NEW_COMMITS_COUNT=$(git rev-list HEAD..upstream/master --count)
+          echo "母仓库待同步的新 Commit 数量: $NEW_COMMITS_COUNT"
+
+          # 统一分支判断：
+          # 1. 有更新 -> 合并推送并构建
+          # 2. 无更新但无 Release -> 触发首次构建
+          # 3. 无更新且已有 Release -> 快速跳过
+          if [ "$NEW_COMMITS_COUNT" -gt 0 ]; then
+            echo "检测到母仓库有 $NEW_COMMITS_COUNT 个新提交，开始自动合并..."
+            git merge upstream/master -m "chore: sync upstream changes"
+            git submodule update --init --recursive
+            git push origin master
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "母仓库有新提交，触发构建流程！"
+          elif ! gh release view snapshot -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "母仓库虽无新提交，但未检测到 snapshot Release，触发首次构建！"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "母仓库无新提交且已存在 Release，代码已是最新，跳过后续构建。"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 4. 配置 JDK 17（仅在需要构建时执行）
+      - name: Set up JDK
+        if: steps.sync.outputs.has_changes == 'true'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # 5. 配置 pnpm / Node 环境并安装 Web 依赖
+      - name: Setup pnpm
+        if: steps.sync.outputs.has_changes == 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        if: steps.sync.outputs.has_changes == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+          cache-dependency-path: 'web-ui/pnpm-lock.yaml'
+
+      - name: Install dependencies for Web UI
+        if: steps.sync.outputs.has_changes == 'true'
+        run: |
+          cd web-ui
+          pnpm install --frozen-lockfile
+
+      # 6. 配置 Gradle 缓存
+      - name: Setup Gradle
+        if: steps.sync.outputs.has_changes == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      # 7. 准备构建文件、替换包名与应用名
+      - name: Prepare build files
+        if: steps.sync.outputs.has_changes == 'true'
+        run: |
+          echo "${{ secrets.KEY_BASE64 }}" | base64 -d > app/app.key
+          echo "${{ secrets.SIGNING_CONFIG }}" > local.properties
+          echo '${{ secrets.GOOGLE_SERVICES_JSON }}' > app/google-services.json
+
+          # 修改 applicationId 实现应用共存
+          sed -i 's/applicationId = "me.rerere.rikkahub"/applicationId = "me.rereredebug.rikkahub"/g' app/build.gradle.kts
+
+          # 修改应用名称为 Rikkahub_debug
+          find app/src/main/res -name "strings.xml" -exec sed -i 's/<string name="app_name">.*<\/string>/<string name="app_name">Rikkahub_debug<\/string>/g' {} +
+
+      # 8. 执行编译打包
+      - name: Build with Gradle
+        if: steps.sync.outputs.has_changes == 'true'
+        run: ./gradlew assembleRelease
+
+      # 9. 发布 Release
+      - name: Release APK
+        if: steps.sync.outputs.has_changes == 'true' && success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: snapshot
+          prerelease: true
+          files: app/build/outputs/apk/release/*.apk
